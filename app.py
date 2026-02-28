@@ -1,7 +1,7 @@
 import os
 import csv
 import io
-import math
+import time
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -10,56 +10,117 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# ---------------------------
+# ENV
+# ---------------------------
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "").strip()
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 
-PG_HOST = os.getenv("PG_HOST", "localhost")
-PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB = os.getenv("PG_DB", "geo_dashboard")
-PG_USER = os.getenv("PG_USER", "postgres")
-PG_PASSWORD = os.getenv("PG_PASSWORD", "")
+# BEST for Render Postgres: set DATABASE_URL env var (Internal Database URL)
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 
-# Optional overrides (in case TomTom endpoints differ for your plan/version)
+# Fallback manual PG_* vars (works if you set them correctly)
+PG_HOST = os.getenv("PG_HOST", "localhost").strip()
+PG_PORT = int(os.getenv("PG_PORT", "5432"))
+PG_DB = os.getenv("PG_DB", "geo_dashboard").strip()
+PG_USER = os.getenv("PG_USER", "postgres").strip()
+PG_PASSWORD = os.getenv("PG_PASSWORD", "").strip()
+
+# Render Postgres usually needs SSL
+PG_SSLMODE = os.getenv("PG_SSLMODE", "require").strip()
+
+# Optional override for traffic tiles
 TOMTOM_TRAFFIC_TILE_URL = os.getenv(
     "TOMTOM_TRAFFIC_TILE_URL",
-    # Common TomTom traffic flow tiles endpoint
     "https://api.tomtom.com/traffic/map/4/tile/flow/relative/{z}/{x}/{y}.png?key={key}",
 )
 
 app = Flask(__name__)
 
-
 # ---------------------------
-# DB helpers (NO schema changes)
+# DB
 # ---------------------------
 def db_conn():
+    """
+    Render recommended:
+      DATABASE_URL = Internal Database URL from Render Postgres
+    Else uses PG_* vars.
+    """
+    if DATABASE_URL:
+        # Ensure sslmode unless already in URL
+        if "sslmode=" in DATABASE_URL:
+            return psycopg2.connect(DATABASE_URL)
+        return psycopg2.connect(DATABASE_URL, sslmode=PG_SSLMODE)
+
+    # If user still uses manual vars:
+    sslmode = PG_SSLMODE if PG_HOST not in ("localhost", "127.0.0.1") else None
     return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD
+        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD, sslmode=sslmode
     )
 
 
+def create_tables():
+    """
+    FIX for your error:
+      psycopg2.errors.UndefinedTable: relation 'geo_search_history' does not exist
+    """
+    ddl = """
+    CREATE TABLE IF NOT EXISTS geo_search_history (
+        id SERIAL PRIMARY KEY,
+        query_text TEXT,
+        place_name TEXT,
+        lat DOUBLE PRECISION,
+        lon DOUBLE PRECISION,
+        temperature_c DOUBLE PRECISION,
+        humidity_pct DOUBLE PRECISION,
+        wind_speed_ms DOUBLE PRECISION,
+        aqi INTEGER,
+        traffic_speed_kmh DOUBLE PRECISION,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    );
+    """
+    # Small retry: DB may not be ready immediately on Render
+    last_err = None
+    for _ in range(6):
+        try:
+            with db_conn() as conn:
+                with conn.cursor() as cur:
+                    cur.execute(ddl)
+                conn.commit()
+            return True
+        except Exception as e:
+            last_err = e
+            time.sleep(1.2)
+    print("DB init failed:", repr(last_err))
+    return False
+
+
 def save_to_db(query_text, place, lat, lon, weather, aqi_0_500, traffic):
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO geo_search_history
-                (query_text, place_name, lat, lon, temperature_c, humidity_pct, wind_speed_ms, aqi, traffic_speed_kmh)
-                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                """,
-                (
-                    query_text,
-                    place,
-                    lat,
-                    lon,
-                    weather.get("temperature_c"),
-                    weather.get("humidity_pct"),
-                    weather.get("wind_speed_ms"),
-                    aqi_0_500,  # stored in SAME 'aqi' column
-                    (traffic or {}).get("currentSpeed_kmh"),
-                ),
-            )
-        conn.commit()
+    # Don't crash your API if DB write fails
+    try:
+        with db_conn() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO geo_search_history
+                    (query_text, place_name, lat, lon, temperature_c, humidity_pct, wind_speed_ms, aqi, traffic_speed_kmh)
+                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                    """,
+                    (
+                        query_text,
+                        place,
+                        lat,
+                        lon,
+                        (weather or {}).get("temperature_c"),
+                        (weather or {}).get("humidity_pct"),
+                        (weather or {}).get("wind_speed_ms"),
+                        aqi_0_500,
+                        (traffic or {}).get("currentSpeed_kmh"),
+                    ),
+                )
+            conn.commit()
+    except Exception as e:
+        print("DB save failed:", repr(e))
 
 
 def fetch_recent(limit=50):
@@ -80,7 +141,6 @@ def fetch_recent(limit=50):
 
 
 def fetch_today_stats():
-    """UI-only stats, no new DB columns."""
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -97,6 +157,9 @@ def fetch_today_stats():
             )
             return cur.fetchone() or {}
 
+
+# Init DB table
+create_tables()
 
 # ---------------------------
 # TomTom / OpenWeather helpers
@@ -145,7 +208,6 @@ def tomtom_reverse(lat: float, lon: float):
 
 
 def tomtom_suggest(query: str, limit: int = 6):
-    # Autocomplete suggestions
     url = f"https://api.tomtom.com/search/2/search/{requests.utils.quote(query)}.json"
     params = {
         "key": TOMTOM_API_KEY,
@@ -181,7 +243,7 @@ def openweather_weather(lat: float, lon: float):
     wind = js.get("wind", {}) or {}
     clouds = js.get("clouds", {}) or {}
     weather0 = (js.get("weather") or [{}])[0] or {}
-    rain = (js.get("rain") or {})  # may contain {"1h":..} or {"3h":..}
+    rain = (js.get("rain") or {})
 
     return {
         "temperature_c": main.get("temp"),
@@ -190,13 +252,13 @@ def openweather_weather(lat: float, lon: float):
         "wind_speed_ms": wind.get("speed"),
         "clouds_pct": clouds.get("all"),
         "rain_1h_mm": rain.get("1h"),
-        "weather_main": weather0.get("main"),      # e.g., Clouds, Rain
+        "weather_main": weather0.get("main"),
         "weather_desc": weather0.get("description"),
     }
 
 
 # ---------------------------
-# AQI 0..500 from PM2.5 + pollutants
+# AQI 0..500 from PM2.5
 # ---------------------------
 def _aqi_from_pm25_us(pm25_ug_m3: float):
     if pm25_ug_m3 is None:
@@ -210,8 +272,7 @@ def _aqi_from_pm25_us(pm25_ug_m3: float):
         (250.5, 350.4, 301, 400),
         (350.5, 500.4, 401, 500),
     ]
-    c = float(pm25_ug_m3)
-    c = max(0.0, c)
+    c = max(0.0, float(pm25_ug_m3))
     if c > 500.4:
         return 500
     for cl, ch, il, ih in bps:
@@ -256,13 +317,6 @@ def aqi_health_tip(a):
 
 
 def openweather_aqi_details(lat: float, lon: float):
-    """
-    Returns:
-      - aqi_0_500
-      - components pollutants
-      - dominant pollutant
-      - label, health_tip
-    """
     url = "https://api.openweathermap.org/data/2.5/air_pollution"
     params = {"lat": lat, "lon": lon, "appid": OPENWEATHER_API_KEY}
     r = requests.get(url, params=params, timeout=20)
@@ -270,14 +324,11 @@ def openweather_aqi_details(lat: float, lon: float):
     js = r.json()
 
     comp = (js.get("list", [{}])[0] or {}).get("components", {}) or {}
-    # ug/m3 fields for OpenWeather:
-    # co, no, no2, o3, so2, pm2_5, pm10, nh3
     pm25 = comp.get("pm2_5")
     aqi_0_500 = _aqi_from_pm25_us(pm25) if pm25 is not None else None
 
     dominant = None
     if comp:
-        # pick max among common pollutants (excluding nh3 if you want)
         keys = ["pm2_5", "pm10", "no2", "so2", "o3", "co"]
         best = None
         for k in keys:
@@ -334,34 +385,24 @@ def tomtom_traffic(lat: float, lon: float):
 
 
 # ---------------------------
-# Routing: multiple modes + turn instructions
+# Routing
 # ---------------------------
 def tomtom_route(o_lat, o_lon, d_lat, d_lon, mode: str):
-    """
-    mode:
-      fastest
-      shortest
-      avoid_tolls
-      avoid_highways
-    """
     url = f"https://api.tomtom.com/routing/1/calculateRoute/{o_lat},{o_lon}:{d_lat},{d_lon}/json"
     params = {
         "key": TOMTOM_API_KEY,
         "traffic": "true",
         "travelMode": "car",
         "computeTravelTimeFor": "all",
-        "instructionsType": "text",  # enables guidanceInstructions on many plans
+        "instructionsType": "text",
         "language": "en-GB",
     }
 
-    # routeType: fastest/shortest
     if mode == "shortest":
         params["routeType"] = "shortest"
     else:
         params["routeType"] = "fastest"
 
-    # avoid options
-    # TomTom accepts avoid=... (comma-separated)
     if mode == "avoid_tolls":
         params["avoid"] = "tollRoads"
     elif mode == "avoid_highways":
@@ -380,14 +421,11 @@ def tomtom_route(o_lat, o_lon, d_lat, d_lon, mode: str):
     time_min = (summary.get("travelTimeInSeconds", 0) or 0) / 60.0
     delay_min = (summary.get("trafficDelayInSeconds", 0) or 0) / 60.0
 
-    # guidance instructions (if available in response)
     instr = []
     try:
         gi = route0.get("guidance", {}).get("instructions", []) or []
         for x in gi[:8]:
-            msg = x.get("message")
-            dist_m = x.get("routeOffsetInMeters")
-            instr.append({"message": msg, "routeOffsetInMeters": dist_m})
+            instr.append({"message": x.get("message"), "routeOffsetInMeters": x.get("routeOffsetInMeters")})
     except Exception:
         instr = []
 
@@ -407,8 +445,8 @@ def tomtom_route(o_lat, o_lon, d_lat, d_lon, mode: str):
 @app.route("/")
 def index():
     traffic_tile = TOMTOM_TRAFFIC_TILE_URL.replace("{key}", TOMTOM_API_KEY)
-    html = r"""
-<!doctype html>
+
+    html = r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
@@ -528,7 +566,6 @@ def index():
       font-weight: 900;
     }
 
-    /* Autocomplete dropdown */
     .suggestBox{
       position:absolute;
       left:0; right:140px; top:54px;
@@ -594,7 +631,6 @@ def index():
     .value{ font-size: 30px; font-weight: 980; margin-top: 4px; }
     .meta{ color: var(--muted); font-size: 12px; margin-top: 4px; }
 
-    /* Temp fire background */
     .tempFire::before{
       content:""; position:absolute; inset:-60px; pointer-events:none;
       background:
@@ -619,7 +655,6 @@ def index():
     }
     @keyframes embersUp{ from{ transform: translateY(0); opacity:.65 } to{ transform: translateY(-26px); opacity:.15 } }
 
-    /* AQI wind animation */
     .aqiWind svg{
       position:absolute; right:-12px; top:-6px;
       opacity:.40;
@@ -642,7 +677,6 @@ def index():
       to   { stroke-dashoffset: -60; transform: translateX(-18px) }
     }
 
-    /* Traffic car anim */
     .carLane{
       position:absolute; left:0; right:0; bottom:8px; height:18px;
       opacity:.18;
@@ -656,7 +690,6 @@ def index():
     }
     @keyframes carDrive{ from{transform:translateX(0)} to{transform:translateX(360px)} }
 
-    /* AQI meter */
     .meter{
       margin-top:10px; position:relative;
       height: 14px; border-radius: 999px; overflow:hidden;
@@ -692,7 +725,6 @@ def index():
     .chartBox{ padding: 14px; height: 320px; }
     canvas{ height: 260px !important; }
 
-    /* Map controls */
     #mapWrap{ position:relative; }
     #map{ height: 360px; border-radius: 18px; border:1px solid var(--stroke); overflow:hidden; }
     .mapCtl{
@@ -719,7 +751,6 @@ def index():
     }
     .mapCtl option{ color:#111; }
 
-    /* Route mode pills */
     .modePills{ display:flex; gap:8px; flex-wrap:wrap; margin-top:10px; }
     .pillBtn{
       padding:8px 10px; border-radius:999px;
@@ -778,7 +809,6 @@ def index():
   <div class="wrap">
     <div class="panel panel-pad">
 
-      <!-- Search + autocomplete -->
       <div class="searchRow">
         <input class="input" id="q" placeholder="Search place (e.g., Bengaluru)" autocomplete="off"/>
         <button class="btn" onclick="doSearch()">Search</button>
@@ -786,7 +816,6 @@ def index():
         <div class="suggestBox" id="sugs"></div>
       </div>
 
-      <!-- Quick actions -->
       <div class="toolbar" style="margin-top:10px;">
         <button class="btn btn-ghost" onclick="useMyLocation()">📍 Use my location</button>
         <button class="btn btn-ghost" onclick="addFav()">⭐ Add favourite</button>
@@ -796,7 +825,6 @@ def index():
         <span style="margin-left:auto;font-weight:900" id="status">Ready</span>
       </div>
 
-      <!-- Route inputs -->
       <div class="toolbar" style="margin-top:10px;">
         <input class="input" id="origin" placeholder="Origin (e.g., Bengaluru)" style="max-width:420px"/>
         <input class="input" id="destination" placeholder="Destination (e.g., Mysuru)" style="max-width:420px"/>
@@ -805,7 +833,6 @@ def index():
         <span style="margin-left:auto; font-weight:900" id="routeInfo">—</span>
       </div>
 
-      <!-- Route modes -->
       <div class="modePills">
         <button class="pillBtn active" id="m_fastest" onclick="setMode('fastest')">Fastest</button>
         <button class="pillBtn" id="m_shortest" onclick="setMode('shortest')">Shortest</button>
@@ -813,7 +840,6 @@ def index():
         <button class="pillBtn" id="m_avoid_highways" onclick="setMode('avoid_highways')">Avoid highways</button>
       </div>
 
-      <!-- Summary stats -->
       <div class="toolbar" style="margin-top:10px;">
         <span class="tag" id="st_n">Today: —</span>
         <span class="tag" id="st_aqi">Avg AQI: —</span>
@@ -823,7 +849,6 @@ def index():
         <button class="btn btn-ghost" style="margin-left:auto" onclick="exportCSV()">⬇ Export CSV</button>
       </div>
 
-      <!-- KPI cards -->
       <div class="kpis">
         <div class="card tempFire">
           <div class="icon">🌡️</div>
@@ -875,7 +900,6 @@ def index():
         </div>
       </div>
 
-      <!-- Charts -->
       <div class="grid2">
         <div class="panel chartBox">
           <div class="label" style="margin-bottom:8px">AQI trend (latest 20)</div>
@@ -887,7 +911,6 @@ def index():
         </div>
       </div>
 
-      <!-- Map -->
       <div style="margin-top:14px" class="panel panel-pad">
         <div class="label" style="margin-bottom:10px">Map</div>
         <div id="mapWrap">
@@ -906,7 +929,6 @@ def index():
       </div>
     </div>
 
-    <!-- RIGHT: recent -->
     <div class="panel">
       <div class="rightHead">
         <div>
@@ -926,7 +948,6 @@ def index():
 
   let lastQuery = "";
   let lastLatLng = null;
-  let autoTimer = null;
   let routeMode = "fastest";
 
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
@@ -938,9 +959,6 @@ def index():
     });
   }
 
-  // ---------------------------
-  // MAP + BASEMAPS + TRAFFIC OVERLAY
-  // ---------------------------
   const map = L.map('map', { zoomControl: true }).setView([20.5937, 78.9629], 5);
 
   const bmOSM = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 });
@@ -960,7 +978,6 @@ def index():
     if(trafficLayerOn && trafficLayer) trafficLayer.bringToFront();
   }
 
-  // Traffic overlay (may require TomTom plan)
   let trafficLayerOn = false;
   let trafficLayer = null;
 
@@ -983,10 +1000,8 @@ def index():
     }
   }
 
-  // Scale bar
   L.control.scale({ imperial:false }).addTo(map);
 
-  // Markers
   let marker = null;
   function setMarker(lat, lon, place){
     lastLatLng = [lat, lon];
@@ -998,12 +1013,11 @@ def index():
     map.setView(lastLatLng, 12, { animate: true });
   }
 
-  // Google-like label icon
   function labelIcon(text){
     const safe = (text||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
     return L.divIcon({
       className:"",
-      html: `<div style="
+      html:`<div style="
         padding:6px 10px; border-radius:999px;
         background: rgba(0,0,0,.62);
         border:1px solid rgba(255,255,255,.18);
@@ -1013,14 +1027,11 @@ def index():
         box-shadow: 0 10px 22px rgba(0,0,0,.35);
         white-space:nowrap;
       ">${safe}</div>`,
-      iconSize: [1,1],
-      iconAnchor: [0,0]
+      iconSize:[1,1],
+      iconAnchor:[0,0]
     });
   }
 
-  // ---------------------------
-  // CHARTS
-  // ---------------------------
   function makeGradient(ctx){
     const g = ctx.createLinearGradient(0, 0, 0, 260);
     g.addColorStop(0, "rgba(6,182,212,.35)");
@@ -1049,9 +1060,6 @@ def index():
     document.getElementById("aqiNeedleDot").style.left = pct + "%";
   }
 
-  // ---------------------------
-  // AUTOCOMPLETE
-  // ---------------------------
   let sugTimer = null;
   const sugBox = document.getElementById("sugs");
   const qEl = document.getElementById("q");
@@ -1087,9 +1095,6 @@ def index():
     }catch(e){}
   }
 
-  // ---------------------------
-  // FAVOURITES (localStorage)
-  // ---------------------------
   function loadFavs(){
     const raw = localStorage.getItem("geo_favs") || "[]";
     let favs = [];
@@ -1127,9 +1132,6 @@ def index():
     doSearch();
   }
 
-  // ---------------------------
-  // MY LOCATION
-  // ---------------------------
   async function useMyLocation(){
     if(!navigator.geolocation){ alert("Geolocation not supported"); return; }
     setStatus("Getting location…");
@@ -1148,9 +1150,6 @@ def index():
     }, ()=>{ setStatus("Location permission denied"); }, { enableHighAccuracy:true, timeout:8000 });
   }
 
-  // ---------------------------
-  // RECENT + STATS + EXPORT
-  // ---------------------------
   async function loadStats(){
     const r = await fetch("/api/stats");
     const js = await r.json();
@@ -1171,14 +1170,14 @@ def index():
     const el = document.getElementById("list");
     el.innerHTML = "";
 
-    js.rows.forEach(row=>{
+    (js.rows || []).forEach(row=>{
       const d = document.createElement("div");
       d.className="item";
       const place = row.place_name || row.query_text;
       d.innerHTML = `
         <div style="font-weight:950">${place}</div>
         <div class="rowMini">
-          <span class="tag">${row.created_at.slice(0,19).replace("T"," ")}</span>
+          <span class="tag">${(row.created_at || "").slice(0,19).replace("T"," ")}</span>
           <span class="tag">Temp: ${row.temperature_c ?? "—"} °C</span>
           <span class="tag">AQI: ${row.aqi ?? "—"} / 500</span>
           <span class="tag">Speed: ${row.traffic_speed_kmh ?? "—"} km/h</span>
@@ -1195,23 +1194,19 @@ def index():
       el.appendChild(d);
     });
 
-    const last = js.rows.slice(0,20).reverse();
-    chartAqi.data.labels = last.map(x=>x.created_at.slice(11,16));
+    const last = (js.rows || []).slice(0,20).reverse();
+    chartAqi.data.labels = last.map(x=>(x.created_at || "").slice(11,16));
     chartAqi.data.datasets[0].data = last.map(x=>x.aqi);
     chartAqi.update();
 
-    chartTrf.data.labels = last.map(x=>x.created_at.slice(11,16));
+    chartTrf.data.labels = last.map(x=>(x.created_at || "").slice(11,16));
     chartTrf.data.datasets[0].data = last.map(x=>x.traffic_speed_kmh);
     chartTrf.update();
   }
 
-  // ---------------------------
-  // SEARCH
-  // ---------------------------
   async function doSearch(){
     const q = document.getElementById("q").value.trim();
     if(!q) return;
-    lastQuery = q;
     setStatus("Fetching…");
 
     const r = await fetch("/api/search?query=" + encodeURIComponent(q));
@@ -1225,7 +1220,6 @@ def index():
     document.getElementById("placePill").innerText =
       `${js.place} (${js.lat.toFixed(5)}, ${js.lon.toFixed(5)})`;
 
-    // Weather
     document.getElementById("kTemp").innerText = (js.temperature_c ?? "—") + (js.temperature_c!=null ? " °C" : "");
     document.getElementById("kHum").innerText = "Humidity: " + (js.humidity_pct ?? "—") + (js.humidity_pct!=null ? " %" : "");
     document.getElementById("kWind").innerText = "Wind: " + (js.wind_speed_ms ?? "—") + (js.wind_speed_ms!=null ? " m/s" : "");
@@ -1237,7 +1231,6 @@ def index():
     if(js.weather_desc) wxBits.push(js.weather_desc);
     document.getElementById("kWx").innerText = wxBits.length ? wxBits.join(" • ") : "—";
 
-    // AQI details
     document.getElementById("kAqi").innerText = (js.aqi?.aqi_0_500 ?? "—");
     document.getElementById("kAqiLbl").innerText = js.aqi?.label ?? "—";
     setAqiNeedle(js.aqi?.aqi_0_500);
@@ -1251,7 +1244,6 @@ def index():
       (dom ? (" • Dominant: " + dom.toUpperCase()) : "");
     document.getElementById("kTip").innerText = "Tip: " + (js.aqi?.health_tip ?? "—");
 
-    // Traffic
     const sp = js.traffic?.currentSpeed_kmh;
     const ff = js.traffic?.freeFlowSpeed_kmh;
     const lbl = js.traffic?.congestion_label;
@@ -1259,7 +1251,6 @@ def index():
     document.getElementById("kTrf2").innerText =
       (lbl ? (lbl + " • ") : "") + "Free flow: " + (ff ?? "—") + (ff!=null ? " km/h" : "");
 
-    // Map marker
     setMarker(js.lat, js.lon, js.place);
     map.setView([js.lat, js.lon], 12, { animate:true });
 
@@ -1268,9 +1259,6 @@ def index():
     setStatus("Updated ✓");
   }
 
-  // ---------------------------
-  // ROUTING: multiple modes + labels + instructions
-  // ---------------------------
   let routeLine = null;
   let carMarker = null;
   let carTimer = null;
@@ -1318,15 +1306,12 @@ def index():
     document.getElementById("routeInfo").innerText =
       `(${js.route.mode}) Distance ${js.route.distance_km} km • ETA ${fmtTime(js.route.travel_time_min)} • Delay ${fmtTime(js.route.traffic_delay_min)}`;
 
-    // Route line
     routeLine = L.polyline(coords, { weight: 6, opacity: 0.9 }).addTo(map);
     map.fitBounds(routeLine.getBounds(), { padding:[20,20] });
 
-    // Origin/Destination labels (pill)
     originMarker = L.marker([js.origin.lat, js.origin.lon], { icon: labelIcon("Origin: "+(js.origin.place || o)) }).addTo(map);
     destMarker = L.marker([js.destination.lat, js.destination.lon], { icon: labelIcon("Destination: "+(js.destination.place || d)) }).addTo(map);
 
-    // Car animation along route
     carMarker = L.marker(coords[0], {
       icon: L.divIcon({ className:"", html:`<div style="font-size:22px;filter:drop-shadow(0 8px 12px rgba(0,0,0,.35));">🚗</div>` })
     }).addTo(map);
@@ -1341,7 +1326,6 @@ def index():
       carMarker.setLatLng(coords[i]);
     }, stepMs);
 
-    // Turn-by-turn (if provided)
     const turns = js.route.instructions || [];
     if(turns.length){
       const box = document.getElementById("turns");
@@ -1358,9 +1342,6 @@ def index():
     }
   }
 
-  // ---------------------------
-  // INIT
-  // ---------------------------
   async function init(){
     loadFavs();
     await loadRecent();
@@ -1377,10 +1358,15 @@ def index():
 # ---------------------------
 # API endpoints
 # ---------------------------
+@app.route("/health")
+def health():
+    return jsonify({"ok": True})
+
+
 @app.route("/api/search")
 def api_search():
     if not TOMTOM_API_KEY or not OPENWEATHER_API_KEY:
-        return jsonify({"error": "Missing API keys. Please set TOMTOM_API_KEY and OPENWEATHER_API_KEY in .env"}), 400
+        return jsonify({"error": "Missing API keys. Please set TOMTOM_API_KEY and OPENWEATHER_API_KEY in Render env vars"}), 400
 
     query = (request.args.get("query") or "").strip()
     if not query:
@@ -1412,15 +1398,22 @@ def api_search():
 
 @app.route("/api/recent")
 def api_recent():
-    rows = fetch_recent(limit=50)
-    for r in rows:
-        r["created_at"] = r["created_at"].isoformat()
+    rows = []
+    try:
+        rows = fetch_recent(limit=50)
+        for r in rows:
+            r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
+    except Exception as e:
+        return jsonify({"rows": [], "error": str(e)}), 500
     return jsonify({"rows": rows})
 
 
 @app.route("/api/stats")
 def api_stats():
-    return jsonify(fetch_today_stats())
+    try:
+        return jsonify(fetch_today_stats())
+    except Exception as e:
+        return jsonify({"n": 0, "avg_temp": None, "avg_aqi": None, "max_aqi": None, "avg_speed": None, "error": str(e)}), 500
 
 
 @app.route("/api/export")
@@ -1447,7 +1440,7 @@ def api_export():
     for r in rows:
         w.writerow(
             [
-                r["created_at"].isoformat(),
+                r["created_at"].isoformat() if r.get("created_at") else "",
                 r.get("query_text"),
                 r.get("place_name"),
                 r.get("lat"),
@@ -1471,7 +1464,7 @@ def api_export():
 @app.route("/api/suggest")
 def api_suggest():
     if not TOMTOM_API_KEY:
-        return jsonify({"error": "Missing TOMTOM_API_KEY in .env"}), 400
+        return jsonify({"error": "Missing TOMTOM_API_KEY"}), 400
     q = (request.args.get("q") or "").strip()
     if len(q) < 3:
         return jsonify({"items": []})
@@ -1484,7 +1477,7 @@ def api_suggest():
 @app.route("/api/reverse")
 def api_reverse():
     if not TOMTOM_API_KEY:
-        return jsonify({"error": "Missing TOMTOM_API_KEY in .env"}), 400
+        return jsonify({"error": "Missing TOMTOM_API_KEY"}), 400
     try:
         lat = float(request.args.get("lat"))
         lon = float(request.args.get("lon"))
@@ -1500,7 +1493,7 @@ def api_reverse():
 @app.route("/api/route")
 def api_route():
     if not TOMTOM_API_KEY:
-        return jsonify({"error": "Missing TOMTOM_API_KEY in .env"}), 400
+        return jsonify({"error": "Missing TOMTOM_API_KEY"}), 400
 
     origin = (request.args.get("origin") or "").strip()
     destination = (request.args.get("destination") or "").strip()
@@ -1519,12 +1512,12 @@ def api_route():
     try:
         route = tomtom_route(o["lat"], o["lon"], d["lat"], d["lon"], mode=mode)
     except requests.HTTPError as e:
-        # if avoid/instructions not allowed by plan, still show readable message
         return jsonify({"error": f"Routing API error. Check TomTom key/plan. Details: {str(e)}"}), 502
 
     return jsonify({"origin": o, "destination": d, "route": route})
 
 
+# Render entrypoint
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+    port = int(os.environ.get("PORT", "10000"))
     app.run(host="0.0.0.0", port=port)
