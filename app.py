@@ -1,7 +1,6 @@
 import os
 import csv
 import io
-import time
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -10,26 +9,15 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# ---------------------------
-# ENV
-# ---------------------------
 TOMTOM_API_KEY = os.getenv("TOMTOM_API_KEY", "").strip()
 OPENWEATHER_API_KEY = os.getenv("OPENWEATHER_API_KEY", "").strip()
 
-# BEST for Render Postgres: set DATABASE_URL env var (Internal Database URL)
-DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
-
-# Fallback manual PG_* vars (works if you set them correctly)
-PG_HOST = os.getenv("PG_HOST", "localhost").strip()
+PG_HOST = os.getenv("PG_HOST", "localhost")
 PG_PORT = int(os.getenv("PG_PORT", "5432"))
-PG_DB = os.getenv("PG_DB", "geo_dashboard").strip()
-PG_USER = os.getenv("PG_USER", "postgres").strip()
-PG_PASSWORD = os.getenv("PG_PASSWORD", "").strip()
+PG_DB = os.getenv("PG_DB", "geo_dashboard")
+PG_USER = os.getenv("PG_USER", "postgres")
+PG_PASSWORD = os.getenv("PG_PASSWORD", "")
 
-# Render Postgres usually needs SSL
-PG_SSLMODE = os.getenv("PG_SSLMODE", "require").strip()
-
-# Optional override for traffic tiles
 TOMTOM_TRAFFIC_TILE_URL = os.getenv(
     "TOMTOM_TRAFFIC_TILE_URL",
     "https://api.tomtom.com/traffic/map/4/tile/flow/relative/{z}/{x}/{y}.png?key={key}",
@@ -37,93 +25,67 @@ TOMTOM_TRAFFIC_TILE_URL = os.getenv(
 
 app = Flask(__name__)
 
+
 # ---------------------------
-# DB
+# DB helpers + auto-create table
 # ---------------------------
 def db_conn():
-    """
-    Render recommended:
-      DATABASE_URL = Internal Database URL from Render Postgres
-    Else uses PG_* vars.
-    """
-    if DATABASE_URL:
-        # Ensure sslmode unless already in URL
-        if "sslmode=" in DATABASE_URL:
-            return psycopg2.connect(DATABASE_URL)
-        return psycopg2.connect(DATABASE_URL, sslmode=PG_SSLMODE)
-
-    # If user still uses manual vars:
-    sslmode = PG_SSLMODE if PG_HOST not in ("localhost", "127.0.0.1") else None
     return psycopg2.connect(
-        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD, sslmode=sslmode
+        host=PG_HOST, port=PG_PORT, dbname=PG_DB, user=PG_USER, password=PG_PASSWORD
     )
 
 
-def create_tables():
-    """
-    FIX for your error:
-      psycopg2.errors.UndefinedTable: relation 'geo_search_history' does not exist
-    """
-    ddl = """
-    CREATE TABLE IF NOT EXISTS geo_search_history (
-        id SERIAL PRIMARY KEY,
-        query_text TEXT,
-        place_name TEXT,
-        lat DOUBLE PRECISION,
-        lon DOUBLE PRECISION,
-        temperature_c DOUBLE PRECISION,
-        humidity_pct DOUBLE PRECISION,
-        wind_speed_ms DOUBLE PRECISION,
-        aqi INTEGER,
-        traffic_speed_kmh DOUBLE PRECISION,
-        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-    );
-    """
-    # Small retry: DB may not be ready immediately on Render
-    last_err = None
-    for _ in range(6):
-        try:
-            with db_conn() as conn:
-                with conn.cursor() as cur:
-                    cur.execute(ddl)
-                conn.commit()
-            return True
-        except Exception as e:
-            last_err = e
-            time.sleep(1.2)
-    print("DB init failed:", repr(last_err))
-    return False
+def init_db():
+    """Create required table if it doesn't exist (Render Postgres starts empty)."""
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                CREATE TABLE IF NOT EXISTS geo_search_history (
+                    id SERIAL PRIMARY KEY,
+                    query_text TEXT,
+                    place_name TEXT,
+                    lat DOUBLE PRECISION,
+                    lon DOUBLE PRECISION,
+                    temperature_c DOUBLE PRECISION,
+                    humidity_pct DOUBLE PRECISION,
+                    wind_speed_ms DOUBLE PRECISION,
+                    aqi INTEGER,
+                    traffic_speed_kmh DOUBLE PRECISION,
+                    created_at TIMESTAMPTZ DEFAULT NOW()
+                );
+                """
+            )
+        conn.commit()
 
 
 def save_to_db(query_text, place, lat, lon, weather, aqi_0_500, traffic):
-    # Don't crash your API if DB write fails
-    try:
-        with db_conn() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    """
-                    INSERT INTO geo_search_history
-                    (query_text, place_name, lat, lon, temperature_c, humidity_pct, wind_speed_ms, aqi, traffic_speed_kmh)
-                    VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                    """,
-                    (
-                        query_text,
-                        place,
-                        lat,
-                        lon,
-                        (weather or {}).get("temperature_c"),
-                        (weather or {}).get("humidity_pct"),
-                        (weather or {}).get("wind_speed_ms"),
-                        aqi_0_500,
-                        (traffic or {}).get("currentSpeed_kmh"),
-                    ),
-                )
-            conn.commit()
-    except Exception as e:
-        print("DB save failed:", repr(e))
+    init_db()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                INSERT INTO geo_search_history
+                (query_text, place_name, lat, lon, temperature_c, humidity_pct, wind_speed_ms, aqi, traffic_speed_kmh)
+                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                """,
+                (
+                    query_text,
+                    place,
+                    lat,
+                    lon,
+                    weather.get("temperature_c"),
+                    weather.get("humidity_pct"),
+                    weather.get("wind_speed_ms"),
+                    aqi_0_500,
+                    (traffic or {}).get("currentSpeed_kmh"),
+                ),
+            )
+        conn.commit()
 
 
-def fetch_recent(limit=50):
+def fetch_recent(limit=5):
+    init_db()
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -141,6 +103,7 @@ def fetch_recent(limit=50):
 
 
 def fetch_today_stats():
+    init_db()
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
             cur.execute(
@@ -157,9 +120,6 @@ def fetch_today_stats():
             )
             return cur.fetchone() or {}
 
-
-# Init DB table
-create_tables()
 
 # ---------------------------
 # TomTom / OpenWeather helpers
@@ -258,7 +218,7 @@ def openweather_weather(lat: float, lon: float):
 
 
 # ---------------------------
-# AQI 0..500 from PM2.5
+# AQI 0..500 from PM2.5 + pollutants
 # ---------------------------
 def _aqi_from_pm25_us(pm25_ug_m3: float):
     if pm25_ug_m3 is None:
@@ -272,7 +232,8 @@ def _aqi_from_pm25_us(pm25_ug_m3: float):
         (250.5, 350.4, 301, 400),
         (350.5, 500.4, 401, 500),
     ]
-    c = max(0.0, float(pm25_ug_m3))
+    c = float(pm25_ug_m3)
+    c = max(0.0, c)
     if c > 500.4:
         return 500
     for cl, ch, il, ih in bps:
@@ -446,7 +407,8 @@ def tomtom_route(o_lat, o_lon, d_lat, d_lon, mode: str):
 def index():
     traffic_tile = TOMTOM_TRAFFIC_TILE_URL.replace("{key}", TOMTOM_API_KEY)
 
-    html = r"""<!doctype html>
+    html = r"""
+<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8"/>
@@ -631,96 +593,6 @@ def index():
     .value{ font-size: 30px; font-weight: 980; margin-top: 4px; }
     .meta{ color: var(--muted); font-size: 12px; margin-top: 4px; }
 
-    .tempFire::before{
-      content:""; position:absolute; inset:-60px; pointer-events:none;
-      background:
-        radial-gradient(220px 140px at 25% 70%, rgba(255,153,0,.28), transparent 60%),
-        radial-gradient(220px 160px at 55% 75%, rgba(255,60,0,.22), transparent 60%),
-        radial-gradient(240px 170px at 80% 70%, rgba(255,200,0,.16), transparent 60%);
-      opacity:.85; animation: fireFlicker 1.2s ease-in-out infinite;
-    }
-    .tempFire::after{
-      content:""; position:absolute; inset:0; pointer-events:none;
-      background:
-        radial-gradient(6px 6px at 15% 85%, rgba(255,220,150,.85), transparent 60%),
-        radial-gradient(5px 5px at 35% 90%, rgba(255,200,120,.75), transparent 60%),
-        radial-gradient(4px 4px at 60% 92%, rgba(255,230,160,.70), transparent 60%),
-        radial-gradient(5px 5px at 80% 88%, rgba(255,210,140,.65), transparent 60%);
-      opacity:.7; animation: embersUp 2.4s linear infinite;
-    }
-    @keyframes fireFlicker{
-      0%{ transform: translate3d(0,0,0) scale(1) }
-      50%{ transform: translate3d(-10px,6px,0) scale(1.02) }
-      100%{ transform: translate3d(0,0,0) scale(1) }
-    }
-    @keyframes embersUp{ from{ transform: translateY(0); opacity:.65 } to{ transform: translateY(-26px); opacity:.15 } }
-
-    .aqiWind svg{
-      position:absolute; right:-12px; top:-6px;
-      opacity:.40;
-      width:150px; height:90px;
-      transform: rotate(-8deg);
-      pointer-events:none;
-    }
-    .aqiWind path{
-      stroke: rgba(6,182,212,.85);
-      stroke-width: 2;
-      fill: none;
-      stroke-linecap: round;
-      stroke-dasharray: 12 10;
-      animation: windMove 2.2s linear infinite;
-    }
-    .aqiWind path:nth-child(2){ opacity:.55; animation-duration: 2.8s }
-    .aqiWind path:nth-child(3){ opacity:.35; animation-duration: 3.3s }
-    @keyframes windMove{
-      from { stroke-dashoffset: 0; transform: translateX(0) }
-      to   { stroke-dashoffset: -60; transform: translateX(-18px) }
-    }
-
-    .carLane{
-      position:absolute; left:0; right:0; bottom:8px; height:18px;
-      opacity:.18;
-      background: linear-gradient(90deg, transparent, rgba(255,255,255,.25), transparent);
-    }
-    .car{
-      position:absolute; bottom:6px; left:-30px;
-      font-size: 16px;
-      animation: carDrive 2.6s linear infinite;
-      opacity:.65;
-    }
-    @keyframes carDrive{ from{transform:translateX(0)} to{transform:translateX(360px)} }
-
-    .meter{
-      margin-top:10px; position:relative;
-      height: 14px; border-radius: 999px; overflow:hidden;
-      border: 1px solid rgba(255,255,255,.14);
-      background: rgba(255,255,255,.08);
-    }
-    .meter .seg{ height:100%; float:left; }
-    .s1{ width:20%; background:#22c55e; }
-    .s2{ width:20%; background:#eab308; }
-    .s3{ width:20%; background:#f97316; }
-    .s4{ width:20%; background:#ef4444; }
-    .s5{ width:20%; background:#7f1d1d; }
-    .needle{
-      position:absolute; top:-6px;
-      width: 2px; height: 26px;
-      background: rgba(255,255,255,.95);
-      transform: translateX(-1px);
-    }
-    .needleDot{
-      position:absolute; top:-9px;
-      width: 10px; height: 10px;
-      border-radius: 999px;
-      background: rgba(255,255,255,.95);
-      transform: translateX(-5px);
-    }
-    .meterTicks{
-      display:flex; justify-content:space-between;
-      font-size:10px; color: rgba(255,255,255,.55);
-      margin-top:6px; font-weight:800;
-    }
-
     .grid2{ display:grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
     .chartBox{ padding: 14px; height: 320px; }
     canvas{ height: 260px !important; }
@@ -850,7 +722,7 @@ def index():
       </div>
 
       <div class="kpis">
-        <div class="card tempFire">
+        <div class="card">
           <div class="icon">🌡️</div>
           <div style="width:100%">
             <div class="label">Temperature</div>
@@ -860,31 +732,15 @@ def index():
           </div>
         </div>
 
-        <div class="card aqiWind">
+        <div class="card">
           <div class="icon">🫁</div>
           <div style="width:100%">
             <div class="label">AQI (0–500)</div>
             <div class="value" id="kAqi">—</div>
             <div class="meta" id="kAqiLbl">—</div>
-
-            <div class="meter">
-              <div class="seg s1"></div><div class="seg s2"></div><div class="seg s3"></div><div class="seg s4"></div><div class="seg s5"></div>
-              <div class="needle" id="aqiNeedle" style="left:0%"></div>
-              <div class="needleDot" id="aqiNeedleDot" style="left:0%"></div>
-            </div>
-            <div class="meterTicks">
-              <span>0</span><span>100</span><span>200</span><span>300</span><span>400</span><span>500</span>
-            </div>
-
             <div class="meta" id="kPoll">Pollutants: —</div>
             <div class="meta" id="kTip">Tip: —</div>
           </div>
-
-          <svg viewBox="0 0 200 100" aria-hidden="true">
-            <path d="M10 35 C40 20, 70 20, 100 35 S160 50, 190 35" />
-            <path d="M20 55 C55 40, 85 40, 120 55 S170 70, 195 55" />
-            <path d="M5 75 C45 62, 80 62, 115 75 S165 88, 198 75" />
-          </svg>
         </div>
 
         <div class="card">
@@ -895,18 +751,16 @@ def index():
             <div class="meta" id="kTrf2">—</div>
             <div class="meta" id="kWind">Wind: —</div>
           </div>
-          <div class="carLane"></div>
-          <div class="car">🚘</div>
         </div>
       </div>
 
       <div class="grid2">
         <div class="panel chartBox">
-          <div class="label" style="margin-bottom:8px">AQI trend (latest 20)</div>
+          <div class="label" style="margin-bottom:8px">AQI trend (last 5)</div>
           <canvas id="cAqi"></canvas>
         </div>
         <div class="panel chartBox">
-          <div class="label" style="margin-bottom:8px">Traffic speed trend (latest 20)</div>
+          <div class="label" style="margin-bottom:8px">Traffic speed trend (last 5)</div>
           <canvas id="cTrf"></canvas>
         </div>
       </div>
@@ -933,7 +787,7 @@ def index():
       <div class="rightHead">
         <div>
           <div style="font-weight:980; font-size:14px">Recent searches</div>
-          <div style="font-size:12px;color:rgba(255,255,255,.65);margin-top:2px">Stored in PostgreSQL</div>
+          <div style="font-size:12px;color:rgba(255,255,255,.65);margin-top:2px">Last 5 only</div>
         </div>
         <button class="btn btn-ghost" onclick="loadRecent()">Refresh</button>
       </div>
@@ -944,13 +798,27 @@ def index():
 <script>
   const TRAFFIC_TILE_URL = "{{TRAFFIC_TILE_URL}}";
 
-  function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
+  function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  let lastQuery = "";
+  // ✅ FIX: Format ISO time in YOUR browser local time
+  function fmtTimeLocal(iso){
+    try{
+      const d = new Date(iso);
+      return d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
+    }catch(e){ return "—"; }
+  }
+  function fmtDateTimeLocal(iso){
+    try{
+      const d = new Date(iso);
+      return d.toLocaleString([], {
+        year:"numeric", month:"2-digit", day:"2-digit",
+        hour:"2-digit", minute:"2-digit"
+      });
+    }catch(e){ return iso || "—"; }
+  }
+
   let lastLatLng = null;
   let routeMode = "fastest";
-
-  function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
   function setMode(m){
     routeMode = m;
@@ -959,16 +827,12 @@ def index():
     });
   }
 
+  // Map
   const map = L.map('map', { zoomControl: true }).setView([20.5937, 78.9629], 5);
-
   const bmOSM = L.tileLayer('https://tile.openstreetmap.org/{z}/{x}/{y}.png', { maxZoom: 19 });
-  const bmDark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', {
-    maxZoom: 20, subdomains: 'abcd'
-  });
+  const bmDark = L.tileLayer('https://{s}.basemaps.cartocdn.com/dark_all/{z}/{x}/{y}{r}.png', { maxZoom: 20, subdomains: 'abcd' });
   const bmSat = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', { maxZoom: 19 });
-
-  let currentBasemap = bmOSM;
-  currentBasemap.addTo(map);
+  let currentBasemap = bmOSM; currentBasemap.addTo(map);
 
   function switchBasemap(){
     const v = document.getElementById("bm").value;
@@ -980,12 +844,8 @@ def index():
 
   let trafficLayerOn = false;
   let trafficLayer = null;
-
   function toggleTraffic(){
-    if(!TRAFFIC_TILE_URL || TRAFFIC_TILE_URL.includes("key=")===false){
-      alert("Traffic tiles URL not configured.");
-      return;
-    }
+    if(!TRAFFIC_TILE_URL){ alert("Traffic tiles not configured."); return; }
     trafficLayerOn = !trafficLayerOn;
     if(trafficLayerOn){
       if(!trafficLayer){
@@ -1013,53 +873,28 @@ def index():
     map.setView(lastLatLng, 12, { animate: true });
   }
 
-  function labelIcon(text){
-    const safe = (text||"").replace(/</g,"&lt;").replace(/>/g,"&gt;");
-    return L.divIcon({
-      className:"",
-      html:`<div style="
-        padding:6px 10px; border-radius:999px;
-        background: rgba(0,0,0,.62);
-        border:1px solid rgba(255,255,255,.18);
-        color: rgba(255,255,255,.92);
-        font-weight: 950; font-size: 12px;
-        backdrop-filter: blur(10px);
-        box-shadow: 0 10px 22px rgba(0,0,0,.35);
-        white-space:nowrap;
-      ">${safe}</div>`,
-      iconSize:[1,1],
-      iconAnchor:[0,0]
-    });
-  }
-
+  // Charts
   function makeGradient(ctx){
     const g = ctx.createLinearGradient(0, 0, 0, 260);
     g.addColorStop(0, "rgba(6,182,212,.35)");
     g.addColorStop(1, "rgba(6,182,212,0)");
     return g;
   }
-
   const ctxA = document.getElementById("cAqi").getContext("2d");
   const ctxT = document.getElementById("cTrf").getContext("2d");
 
   const chartAqi = new Chart(ctxA, {
     type:"line",
     data:{ labels:[], datasets:[{ data:[], tension:.35, borderWidth:2.5, pointRadius:3.5, fill:true, backgroundColor: makeGradient(ctxA) }]},
-    options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, animation:{ duration:900 }, scales:{} }
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, animation:{ duration:900 } }
   });
   const chartTrf = new Chart(ctxT, {
     type:"line",
     data:{ labels:[], datasets:[{ data:[], tension:.35, borderWidth:2.5, pointRadius:3.5, fill:true, backgroundColor: makeGradient(ctxT) }]},
-    options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, animation:{ duration:900 }, scales:{} }
+    options:{ responsive:true, maintainAspectRatio:false, plugins:{ legend:{ display:false } }, animation:{ duration:900 } }
   });
 
-  function setAqiNeedle(aqi){
-    const v = (aqi==null) ? 0 : clamp(Number(aqi), 0, 500);
-    const pct = (v / 500) * 100;
-    document.getElementById("aqiNeedle").style.left = pct + "%";
-    document.getElementById("aqiNeedleDot").style.left = pct + "%";
-  }
-
+  // Suggest
   let sugTimer = null;
   const sugBox = document.getElementById("sugs");
   const qEl = document.getElementById("q");
@@ -1070,7 +905,6 @@ def index():
     if(q.length < 3){ sugBox.style.display="none"; return; }
     sugTimer = setTimeout(()=>loadSuggest(q), 180);
   });
-
   qEl.addEventListener("blur", ()=> setTimeout(()=>{ sugBox.style.display="none"; }, 150));
 
   async function loadSuggest(q){
@@ -1095,6 +929,7 @@ def index():
     }catch(e){}
   }
 
+  // Favourites
   function loadFavs(){
     const raw = localStorage.getItem("geo_favs") || "[]";
     let favs = [];
@@ -1132,6 +967,7 @@ def index():
     doSearch();
   }
 
+  // My location
   async function useMyLocation(){
     if(!navigator.geolocation){ alert("Geolocation not supported"); return; }
     setStatus("Getting location…");
@@ -1150,6 +986,7 @@ def index():
     }, ()=>{ setStatus("Location permission denied"); }, { enableHighAccuracy:true, timeout:8000 });
   }
 
+  // Stats + Export
   async function loadStats(){
     const r = await fetch("/api/stats");
     const js = await r.json();
@@ -1159,56 +996,58 @@ def index():
     document.getElementById("st_spd").innerText = "Avg speed: " + (js.avg_speed!=null ? js.avg_speed.toFixed(0)+" km/h" : "—");
     document.getElementById("st_tmp").innerText = "Avg temp: " + (js.avg_temp!=null ? js.avg_temp.toFixed(1)+" °C" : "—");
   }
+  function exportCSV(){ window.open("/api/export?limit=200", "_blank"); }
 
-  function exportCSV(){
-    window.open("/api/export?limit=200", "_blank");
-  }
-
+  // ✅ FIX: recent searches ONLY LAST 5 + chart labels use local time
   async function loadRecent(){
-    const r = await fetch("/api/recent");
+    const r = await fetch("/api/recent?limit=5");
     const js = await r.json();
     const el = document.getElementById("list");
     el.innerHTML = "";
 
-    (js.rows || []).forEach(row=>{
+    js.rows.forEach(row=>{
       const d = document.createElement("div");
       d.className="item";
       const place = row.place_name || row.query_text;
+
       d.innerHTML = `
         <div style="font-weight:950">${place}</div>
         <div class="rowMini">
-          <span class="tag">${(row.created_at || "").slice(0,19).replace("T"," ")}</span>
+          <span class="tag">${fmtDateTimeLocal(row.created_at)}</span>
           <span class="tag">Temp: ${row.temperature_c ?? "—"} °C</span>
           <span class="tag">AQI: ${row.aqi ?? "—"} / 500</span>
           <span class="tag">Speed: ${row.traffic_speed_kmh ?? "—"} km/h</span>
         </div>
       `;
+
       d.onclick = ()=>{
         document.getElementById("q").value = row.query_text || place;
         if(row.lat && row.lon){
           setMarker(row.lat, row.lon, place);
-          document.getElementById("placePill").innerText = `${place} (${Number(row.lat).toFixed(5)}, ${Number(row.lon).toFixed(5)})`;
+          document.getElementById("placePill").innerText =
+            `${place} (${Number(row.lat).toFixed(5)}, ${Number(row.lon).toFixed(5)})`;
           recenter();
         }
       };
       el.appendChild(d);
     });
 
-    const last = (js.rows || []).slice(0,20).reverse();
-    chartAqi.data.labels = last.map(x=>(x.created_at || "").slice(11,16));
+    const last = js.rows.slice(0, 5).reverse();
+    chartAqi.data.labels = last.map(x=>fmtTimeLocal(x.created_at));
     chartAqi.data.datasets[0].data = last.map(x=>x.aqi);
     chartAqi.update();
 
-    chartTrf.data.labels = last.map(x=>(x.created_at || "").slice(11,16));
+    chartTrf.data.labels = last.map(x=>fmtTimeLocal(x.created_at));
     chartTrf.data.datasets[0].data = last.map(x=>x.traffic_speed_kmh);
     chartTrf.update();
   }
 
+  // Search
   async function doSearch(){
     const q = document.getElementById("q").value.trim();
     if(!q) return;
-    setStatus("Fetching…");
 
+    setStatus("Fetching…");
     const r = await fetch("/api/search?query=" + encodeURIComponent(q));
     const js = await r.json();
     if(js.error){
@@ -1233,7 +1072,6 @@ def index():
 
     document.getElementById("kAqi").innerText = (js.aqi?.aqi_0_500 ?? "—");
     document.getElementById("kAqiLbl").innerText = js.aqi?.label ?? "—";
-    setAqiNeedle(js.aqi?.aqi_0_500);
 
     const comp = js.aqi?.components || {};
     const dom = js.aqi?.dominant;
@@ -1259,18 +1097,15 @@ def index():
     setStatus("Updated ✓");
   }
 
+  // Routing
   let routeLine = null;
   let carMarker = null;
   let carTimer = null;
-  let originMarker = null;
-  let destMarker = null;
 
   function stopRouteAnim(){
     if(carTimer){ clearInterval(carTimer); carTimer = null; }
     if(carMarker){ map.removeLayer(carMarker); carMarker = null; }
     if(routeLine){ map.removeLayer(routeLine); routeLine = null; }
-    if(originMarker){ map.removeLayer(originMarker); originMarker = null; }
-    if(destMarker){ map.removeLayer(destMarker); destMarker = null; }
     document.getElementById("turns").style.display = "none";
     document.getElementById("turns").innerHTML = "";
     document.getElementById("routeInfo").innerText = "—";
@@ -1291,7 +1126,6 @@ def index():
     if(!o || !d){ alert("Enter origin and destination"); return; }
 
     document.getElementById("routeInfo").innerText = "Fetching route…";
-
     const r = await fetch("/api/route?origin=" + encodeURIComponent(o) + "&destination=" + encodeURIComponent(d) + "&mode=" + encodeURIComponent(routeMode));
     const js = await r.json();
     if(js.error){
@@ -1309,22 +1143,18 @@ def index():
     routeLine = L.polyline(coords, { weight: 6, opacity: 0.9 }).addTo(map);
     map.fitBounds(routeLine.getBounds(), { padding:[20,20] });
 
-    originMarker = L.marker([js.origin.lat, js.origin.lon], { icon: labelIcon("Origin: "+(js.origin.place || o)) }).addTo(map);
-    destMarker = L.marker([js.destination.lat, js.destination.lon], { icon: labelIcon("Destination: "+(js.destination.place || d)) }).addTo(map);
-
     carMarker = L.marker(coords[0], {
-      icon: L.divIcon({ className:"", html:`<div style="font-size:22px;filter:drop-shadow(0 8px 12px rgba(0,0,0,.35));">🚗</div>` })
+      icon: L.divIcon({ className:"", html:`<div style="font-size:22px;">🚗</div>` })
     }).addTo(map);
 
     let i = 0;
-    const stepMs = 55;
     carTimer = setInterval(()=>{
       i++;
       if(i >= coords.length){
         clearInterval(carTimer); carTimer = null; return;
       }
       carMarker.setLatLng(coords[i]);
-    }, stepMs);
+    }, 55);
 
     const turns = js.route.instructions || [];
     if(turns.length){
@@ -1337,11 +1167,10 @@ def index():
         s.innerText = t.message || "—";
         box.appendChild(s);
       });
-    }else{
-      document.getElementById("turns").style.display = "none";
     }
   }
 
+  // Init
   async function init(){
     loadFavs();
     await loadRecent();
@@ -1358,15 +1187,10 @@ def index():
 # ---------------------------
 # API endpoints
 # ---------------------------
-@app.route("/health")
-def health():
-    return jsonify({"ok": True})
-
-
 @app.route("/api/search")
 def api_search():
     if not TOMTOM_API_KEY or not OPENWEATHER_API_KEY:
-        return jsonify({"error": "Missing API keys. Please set TOMTOM_API_KEY and OPENWEATHER_API_KEY in Render env vars"}), 400
+        return jsonify({"error": "Missing API keys. Set TOMTOM_API_KEY and OPENWEATHER_API_KEY in Render env vars."}), 400
 
     query = (request.args.get("query") or "").strip()
     if not query:
@@ -1398,22 +1222,16 @@ def api_search():
 
 @app.route("/api/recent")
 def api_recent():
-    rows = []
-    try:
-        rows = fetch_recent(limit=50)
-        for r in rows:
-            r["created_at"] = r["created_at"].isoformat() if r.get("created_at") else None
-    except Exception as e:
-        return jsonify({"rows": [], "error": str(e)}), 500
+    limit = int(request.args.get("limit") or 5)
+    rows = fetch_recent(limit=limit)
+    for r in rows:
+        r["created_at"] = r["created_at"].isoformat()
     return jsonify({"rows": rows})
 
 
 @app.route("/api/stats")
 def api_stats():
-    try:
-        return jsonify(fetch_today_stats())
-    except Exception as e:
-        return jsonify({"n": 0, "avg_temp": None, "avg_aqi": None, "max_aqi": None, "avg_speed": None, "error": str(e)}), 500
+    return jsonify(fetch_today_stats())
 
 
 @app.route("/api/export")
@@ -1440,7 +1258,7 @@ def api_export():
     for r in rows:
         w.writerow(
             [
-                r["created_at"].isoformat() if r.get("created_at") else "",
+                r["created_at"].isoformat(),
                 r.get("query_text"),
                 r.get("place_name"),
                 r.get("lat"),
@@ -1464,7 +1282,7 @@ def api_export():
 @app.route("/api/suggest")
 def api_suggest():
     if not TOMTOM_API_KEY:
-        return jsonify({"error": "Missing TOMTOM_API_KEY"}), 400
+        return jsonify({"error": "Missing TOMTOM_API_KEY in env vars"}), 400
     q = (request.args.get("q") or "").strip()
     if len(q) < 3:
         return jsonify({"items": []})
@@ -1477,7 +1295,7 @@ def api_suggest():
 @app.route("/api/reverse")
 def api_reverse():
     if not TOMTOM_API_KEY:
-        return jsonify({"error": "Missing TOMTOM_API_KEY"}), 400
+        return jsonify({"error": "Missing TOMTOM_API_KEY in env vars"}), 400
     try:
         lat = float(request.args.get("lat"))
         lon = float(request.args.get("lon"))
@@ -1493,7 +1311,7 @@ def api_reverse():
 @app.route("/api/route")
 def api_route():
     if not TOMTOM_API_KEY:
-        return jsonify({"error": "Missing TOMTOM_API_KEY"}), 400
+        return jsonify({"error": "Missing TOMTOM_API_KEY in env vars"}), 400
 
     origin = (request.args.get("origin") or "").strip()
     destination = (request.args.get("destination") or "").strip()
@@ -1517,7 +1335,8 @@ def api_route():
     return jsonify({"origin": o, "destination": d, "route": route})
 
 
-# Render entrypoint
+# Render-friendly run
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", "10000"))
+    init_db()
+    port = int(os.environ.get("PORT", 10000))
     app.run(host="0.0.0.0", port=port)
