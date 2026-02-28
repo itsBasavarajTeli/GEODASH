@@ -84,7 +84,7 @@ def save_to_db(query_text, place, lat, lon, weather, aqi_0_500, traffic):
         conn.commit()
 
 
-def fetch_recent(limit=5):
+def fetch_recent(limit=20):
     init_db()
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -593,6 +593,98 @@ def index():
     .value{ font-size: 30px; font-weight: 980; margin-top: 4px; }
     .meta{ color: var(--muted); font-size: 12px; margin-top: 4px; }
 
+    /* ------------ KPI ANIMATIONS (from your sample) ------------ */
+    .tempFire::before{
+      content:""; position:absolute; inset:-60px; pointer-events:none;
+      background:
+        radial-gradient(220px 140px at 25% 70%, rgba(255,153,0,.28), transparent 60%),
+        radial-gradient(220px 160px at 55% 75%, rgba(255,60,0,.22), transparent 60%),
+        radial-gradient(240px 170px at 80% 70%, rgba(255,200,0,.16), transparent 60%);
+      opacity:.85; animation: fireFlicker 1.2s ease-in-out infinite;
+    }
+    .tempFire::after{
+      content:""; position:absolute; inset:0; pointer-events:none;
+      background:
+        radial-gradient(6px 6px at 15% 85%, rgba(255,220,150,.85), transparent 60%),
+        radial-gradient(5px 5px at 35% 90%, rgba(255,200,120,.75), transparent 60%),
+        radial-gradient(4px 4px at 60% 92%, rgba(255,230,160,.70), transparent 60%),
+        radial-gradient(5px 5px at 80% 88%, rgba(255,210,140,.65), transparent 60%);
+      opacity:.7; animation: embersUp 2.4s linear infinite;
+    }
+    @keyframes fireFlicker{
+      0%{ transform: translate3d(0,0,0) scale(1) }
+      50%{ transform: translate3d(-10px,6px,0) scale(1.02) }
+      100%{ transform: translate3d(0,0,0) scale(1) }
+    }
+    @keyframes embersUp{ from{ transform: translateY(0); opacity:.65 } to{ transform: translateY(-26px); opacity:.15 } }
+
+    .aqiWind svg{
+      position:absolute; right:-12px; top:-6px;
+      opacity:.40;
+      width:150px; height:90px;
+      transform: rotate(-8deg);
+      pointer-events:none;
+    }
+    .aqiWind path{
+      stroke: rgba(6,182,212,.85);
+      stroke-width: 2;
+      fill: none;
+      stroke-linecap: round;
+      stroke-dasharray: 12 10;
+      animation: windMove 2.2s linear infinite;
+    }
+    .aqiWind path:nth-child(2){ opacity:.55; animation-duration: 2.8s }
+    .aqiWind path:nth-child(3){ opacity:.35; animation-duration: 3.3s }
+    @keyframes windMove{
+      from { stroke-dashoffset: 0; transform: translateX(0) }
+      to   { stroke-dashoffset: -60; transform: translateX(-18px) }
+    }
+
+    .carLane{
+      position:absolute; left:0; right:0; bottom:8px; height:18px;
+      opacity:.18;
+      background: linear-gradient(90deg, transparent, rgba(255,255,255,.25), transparent);
+    }
+    .car{
+      position:absolute; bottom:6px; left:-30px;
+      font-size: 16px;
+      animation: carDrive 2.6s linear infinite;
+      opacity:.65;
+    }
+    @keyframes carDrive{ from{transform:translateX(0)} to{transform:translateX(360px)} }
+
+    .meter{
+      margin-top:10px; position:relative;
+      height: 14px; border-radius: 999px; overflow:hidden;
+      border: 1px solid rgba(255,255,255,.14);
+      background: rgba(255,255,255,.08);
+    }
+    .meter .seg{ height:100%; float:left; }
+    .s1{ width:20%; background:#22c55e; }
+    .s2{ width:20%; background:#eab308; }
+    .s3{ width:20%; background:#f97316; }
+    .s4{ width:20%; background:#ef4444; }
+    .s5{ width:20%; background:#7f1d1d; }
+    .needle{
+      position:absolute; top:-6px;
+      width: 2px; height: 26px;
+      background: rgba(255,255,255,.95);
+      transform: translateX(-1px);
+    }
+    .needleDot{
+      position:absolute; top:-9px;
+      width: 10px; height: 10px;
+      border-radius: 999px;
+      background: rgba(255,255,255,.95);
+      transform: translateX(-5px);
+    }
+    .meterTicks{
+      display:flex; justify-content:space-between;
+      font-size:10px; color: rgba(255,255,255,.55);
+      margin-top:6px; font-weight:800;
+    }
+    /* ------------ end KPI animations ------------ */
+
     .grid2{ display:grid; grid-template-columns: 1fr 1fr; gap: 14px; margin-top: 14px; }
     .chartBox{ padding: 14px; height: 320px; }
     canvas{ height: 260px !important; }
@@ -722,7 +814,8 @@ def index():
       </div>
 
       <div class="kpis">
-        <div class="card">
+        <!-- ✅ animation class added -->
+        <div class="card tempFire">
           <div class="icon">🌡️</div>
           <div style="width:100%">
             <div class="label">Temperature</div>
@@ -732,17 +825,35 @@ def index():
           </div>
         </div>
 
-        <div class="card">
+        <!-- ✅ animation class + SVG + AQI meter added -->
+        <div class="card aqiWind">
           <div class="icon">🫁</div>
           <div style="width:100%">
             <div class="label">AQI (0–500)</div>
             <div class="value" id="kAqi">—</div>
             <div class="meta" id="kAqiLbl">—</div>
+
+            <div class="meter">
+              <div class="seg s1"></div><div class="seg s2"></div><div class="seg s3"></div><div class="seg s4"></div><div class="seg s5"></div>
+              <div class="needle" id="aqiNeedle" style="left:0%"></div>
+              <div class="needleDot" id="aqiNeedleDot" style="left:0%"></div>
+            </div>
+            <div class="meterTicks">
+              <span>0</span><span>100</span><span>200</span><span>300</span><span>400</span><span>500</span>
+            </div>
+
             <div class="meta" id="kPoll">Pollutants: —</div>
             <div class="meta" id="kTip">Tip: —</div>
           </div>
+
+          <svg viewBox="0 0 200 100" aria-hidden="true">
+            <path d="M10 35 C40 20, 70 20, 100 35 S160 50, 190 35" />
+            <path d="M20 55 C55 40, 85 40, 120 55 S170 70, 195 55" />
+            <path d="M5 75 C45 62, 80 62, 115 75 S165 88, 198 75" />
+          </svg>
         </div>
 
+        <!-- ✅ moving car added -->
         <div class="card">
           <div class="icon">🚗</div>
           <div style="width:100%">
@@ -751,16 +862,18 @@ def index():
             <div class="meta" id="kTrf2">—</div>
             <div class="meta" id="kWind">Wind: —</div>
           </div>
+          <div class="carLane"></div>
+          <div class="car">🚘</div>
         </div>
       </div>
 
       <div class="grid2">
         <div class="panel chartBox">
-          <div class="label" style="margin-bottom:8px">AQI trend (last 5)</div>
+          <div class="label" style="margin-bottom:8px">AQI trend (latest 20)</div>
           <canvas id="cAqi"></canvas>
         </div>
         <div class="panel chartBox">
-          <div class="label" style="margin-bottom:8px">Traffic speed trend (last 5)</div>
+          <div class="label" style="margin-bottom:8px">Traffic speed trend (latest 20)</div>
           <canvas id="cTrf"></canvas>
         </div>
       </div>
@@ -798,9 +911,10 @@ def index():
 <script>
   const TRAFFIC_TILE_URL = "{{TRAFFIC_TILE_URL}}";
 
+  function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  // ✅ FIX: Format ISO time in YOUR browser local time (NO slicing)
+  // ✅ time fix: show local browser time
   function fmtTimeLocal(iso){
     try{
       const d = new Date(iso);
@@ -815,6 +929,13 @@ def index():
         hour:"2-digit", minute:"2-digit"
       });
     }catch(e){ return iso || "—"; }
+  }
+
+  function setAqiNeedle(aqi){
+    const v = (aqi==null) ? 0 : clamp(Number(aqi), 0, 500);
+    const pct = (v / 500) * 100;
+    document.getElementById("aqiNeedle").style.left = pct + "%";
+    document.getElementById("aqiNeedleDot").style.left = pct + "%";
   }
 
   let lastLatLng = null;
@@ -859,7 +980,6 @@ def index():
       setStatus("Traffic overlay OFF");
     }
   }
-
   L.control.scale({ imperial:false }).addTo(map);
 
   let marker = null;
@@ -998,14 +1118,20 @@ def index():
   }
   function exportCSV(){ window.open("/api/export?limit=200", "_blank"); }
 
-  // ✅ FIX: recent searches ONLY LAST 5 + chart labels use local time (NO slicing)
+  // ✅ One fetch gives both:
+  // - list = first 5
+  // - charts = latest 20
   async function loadRecent(){
-    const r = await fetch("/api/recent?limit=5");
+    const r = await fetch("/api/recent?limit=20");
     const js = await r.json();
+
     const el = document.getElementById("list");
     el.innerHTML = "";
 
-    js.rows.forEach(row=>{
+    const rows = js.rows || [];
+
+    // list: last 5
+    rows.slice(0,5).forEach(row=>{
       const d = document.createElement("div");
       d.className="item";
       const place = row.place_name || row.query_text;
@@ -1032,13 +1158,14 @@ def index():
       el.appendChild(d);
     });
 
-    const last = js.rows.slice(0, 5).reverse();
-    chartAqi.data.labels = last.map(x=>fmtTimeLocal(x.created_at));
-    chartAqi.data.datasets[0].data = last.map(x=>x.aqi);
+    // charts: latest 20 (oldest->newest)
+    const last20 = rows.slice(0,20).reverse();
+    chartAqi.data.labels = last20.map(x=>fmtTimeLocal(x.created_at));
+    chartAqi.data.datasets[0].data = last20.map(x=>x.aqi);
     chartAqi.update();
 
-    chartTrf.data.labels = last.map(x=>fmtTimeLocal(x.created_at));
-    chartTrf.data.datasets[0].data = last.map(x=>x.traffic_speed_kmh);
+    chartTrf.data.labels = last20.map(x=>fmtTimeLocal(x.created_at));
+    chartTrf.data.datasets[0].data = last20.map(x=>x.traffic_speed_kmh);
     chartTrf.update();
   }
 
@@ -1070,8 +1197,11 @@ def index():
     if(js.weather_desc) wxBits.push(js.weather_desc);
     document.getElementById("kWx").innerText = wxBits.length ? wxBits.join(" • ") : "—";
 
-    document.getElementById("kAqi").innerText = (js.aqi?.aqi_0_500 ?? "—");
+    // AQI
+    const aqiVal = js.aqi?.aqi_0_500;
+    document.getElementById("kAqi").innerText = (aqiVal ?? "—");
     document.getElementById("kAqiLbl").innerText = js.aqi?.label ?? "—";
+    setAqiNeedle(aqiVal);
 
     const comp = js.aqi?.components || {};
     const dom = js.aqi?.dominant;
@@ -1082,6 +1212,7 @@ def index():
       (dom ? (" • Dominant: " + dom.toUpperCase()) : "");
     document.getElementById("kTip").innerText = "Tip: " + (js.aqi?.health_tip ?? "—");
 
+    // Traffic
     const sp = js.traffic?.currentSpeed_kmh;
     const ff = js.traffic?.freeFlowSpeed_kmh;
     const lbl = js.traffic?.congestion_label;
@@ -1170,7 +1301,6 @@ def index():
     }
   }
 
-  // Init
   async function init(){
     loadFavs();
     await loadRecent();
@@ -1222,7 +1352,8 @@ def api_search():
 
 @app.route("/api/recent")
 def api_recent():
-    limit = int(request.args.get("limit") or 5)
+    limit = int(request.args.get("limit") or 20)
+    limit = max(1, min(limit, 200))
     rows = fetch_recent(limit=limit)
     for r in rows:
         r["created_at"] = r["created_at"].isoformat()
@@ -1335,7 +1466,6 @@ def api_route():
     return jsonify({"origin": o, "destination": d, "route": route})
 
 
-# Render-friendly run
 if __name__ == "__main__":
     init_db()
     port = int(os.environ.get("PORT", 10000))
