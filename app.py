@@ -800,7 +800,7 @@ def index():
 
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  // ✅ FIX: Format ISO time in YOUR browser local time (NO slicing)
+  // ✅ FIX: Format ISO time in YOUR browser local time
   function fmtTimeLocal(iso){
     try{
       const d = new Date(iso);
@@ -998,7 +998,7 @@ def index():
   }
   function exportCSV(){ window.open("/api/export?limit=200", "_blank"); }
 
-  // ✅ FIX: recent searches ONLY LAST 5 + chart labels use local time (NO slicing)
+  // ✅ FIX: recent searches ONLY LAST 5 + chart labels use local time
   async function loadRecent(){
     const r = await fetch("/api/recent?limit=5");
     const js = await r.json();
