@@ -593,7 +593,7 @@ def index():
     .value{ font-size: 30px; font-weight: 980; margin-top: 4px; }
     .meta{ color: var(--muted); font-size: 12px; margin-top: 4px; }
 
-    /* ------------ KPI ANIMATIONS (from your sample) ------------ */
+    /* ------------ KPI ANIMATIONS ------------ */
     .tempFire::before{
       content:""; position:absolute; inset:-60px; pointer-events:none;
       background:
@@ -814,7 +814,7 @@ def index():
       </div>
 
       <div class="kpis">
-        <!-- ✅ animation class added -->
+        <!-- Temperature: Fire animation -->
         <div class="card tempFire">
           <div class="icon">🌡️</div>
           <div style="width:100%">
@@ -825,7 +825,7 @@ def index():
           </div>
         </div>
 
-        <!-- ✅ animation class + SVG + AQI meter added -->
+        <!-- AQI: Wind animation + Meter -->
         <div class="card aqiWind">
           <div class="icon">🫁</div>
           <div style="width:100%">
@@ -853,7 +853,7 @@ def index():
           </svg>
         </div>
 
-        <!-- ✅ moving car added -->
+        <!-- Traffic: Moving car -->
         <div class="card">
           <div class="icon">🚗</div>
           <div style="width:100%">
@@ -914,7 +914,7 @@ def index():
   function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  // ✅ time fix: show local browser time
+  // show local browser time
   function fmtTimeLocal(iso){
     try{
       const d = new Date(iso);
@@ -1118,9 +1118,6 @@ def index():
   }
   function exportCSV(){ window.open("/api/export?limit=200", "_blank"); }
 
-  // ✅ One fetch gives both:
-  // - list = first 5
-  // - charts = latest 20
   async function loadRecent(){
     const r = await fetch("/api/recent?limit=20");
     const js = await r.json();
@@ -1130,7 +1127,6 @@ def index():
 
     const rows = js.rows || [];
 
-    // list: last 5
     rows.slice(0,5).forEach(row=>{
       const d = document.createElement("div");
       d.className="item";
@@ -1158,7 +1154,6 @@ def index():
       el.appendChild(d);
     });
 
-    // charts: latest 20 (oldest->newest)
     const last20 = rows.slice(0,20).reverse();
     chartAqi.data.labels = last20.map(x=>fmtTimeLocal(x.created_at));
     chartAqi.data.datasets[0].data = last20.map(x=>x.aqi);
@@ -1169,7 +1164,6 @@ def index():
     chartTrf.update();
   }
 
-  // Search
   async function doSearch(){
     const q = document.getElementById("q").value.trim();
     if(!q) return;
