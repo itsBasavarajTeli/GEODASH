@@ -1,8 +1,6 @@
 import os
 import csv
 import io
-from datetime import timezone
-
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
@@ -388,12 +386,7 @@ def tomtom_route(o_lat, o_lon, d_lat, d_lon, mode: str):
     try:
         gi = route0.get("guidance", {}).get("instructions", []) or []
         for x in gi[:8]:
-            instr.append(
-                {
-                    "message": x.get("message"),
-                    "routeOffsetInMeters": x.get("routeOffsetInMeters"),
-                }
-            )
+            instr.append({"message": x.get("message"), "routeOffsetInMeters": x.get("routeOffsetInMeters")})
     except Exception:
         instr = []
 
@@ -804,23 +797,24 @@ def index():
 
 <script>
   const TRAFFIC_TILE_URL = "{{TRAFFIC_TILE_URL}}";
+
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  // ✅ FINAL FIX: Use epoch milliseconds from server (always correct)
-  function fmtTimeLocalFromMs(ms){
+  // ✅ FIX: Format ISO time in YOUR browser local time (NO slicing)
+  function fmtTimeLocal(iso){
     try{
-      const d = new Date(Number(ms));
+      const d = new Date(iso);
       return d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
     }catch(e){ return "—"; }
   }
-  function fmtDateTimeLocalFromMs(ms){
+  function fmtDateTimeLocal(iso){
     try{
-      const d = new Date(Number(ms));
+      const d = new Date(iso);
       return d.toLocaleString([], {
         year:"numeric", month:"2-digit", day:"2-digit",
         hour:"2-digit", minute:"2-digit"
       });
-    }catch(e){ return "—"; }
+    }catch(e){ return iso || "—"; }
   }
 
   let lastLatLng = null;
@@ -1004,7 +998,7 @@ def index():
   }
   function exportCSV(){ window.open("/api/export?limit=200", "_blank"); }
 
-  // Recent + charts
+  // ✅ FIX: recent searches ONLY LAST 5 + chart labels use local time (NO slicing)
   async function loadRecent(){
     const r = await fetch("/api/recent?limit=5");
     const js = await r.json();
@@ -1019,7 +1013,7 @@ def index():
       d.innerHTML = `
         <div style="font-weight:950">${place}</div>
         <div class="rowMini">
-          <span class="tag">${fmtDateTimeLocalFromMs(row.created_at_ms)}</span>
+          <span class="tag">${fmtDateTimeLocal(row.created_at)}</span>
           <span class="tag">Temp: ${row.temperature_c ?? "—"} °C</span>
           <span class="tag">AQI: ${row.aqi ?? "—"} / 500</span>
           <span class="tag">Speed: ${row.traffic_speed_kmh ?? "—"} km/h</span>
@@ -1039,11 +1033,11 @@ def index():
     });
 
     const last = js.rows.slice(0, 5).reverse();
-    chartAqi.data.labels = last.map(x=>fmtTimeLocalFromMs(x.created_at_ms));
+    chartAqi.data.labels = last.map(x=>fmtTimeLocal(x.created_at));
     chartAqi.data.datasets[0].data = last.map(x=>x.aqi);
     chartAqi.update();
 
-    chartTrf.data.labels = last.map(x=>fmtTimeLocalFromMs(x.created_at_ms));
+    chartTrf.data.labels = last.map(x=>fmtTimeLocal(x.created_at));
     chartTrf.data.datasets[0].data = last.map(x=>x.traffic_speed_kmh);
     chartTrf.update();
   }
@@ -1196,9 +1190,7 @@ def index():
 @app.route("/api/search")
 def api_search():
     if not TOMTOM_API_KEY or not OPENWEATHER_API_KEY:
-        return jsonify(
-            {"error": "Missing API keys. Set TOMTOM_API_KEY and OPENWEATHER_API_KEY in Render env vars."}
-        ), 400
+        return jsonify({"error": "Missing API keys. Set TOMTOM_API_KEY and OPENWEATHER_API_KEY in Render env vars."}), 400
 
     query = (request.args.get("query") or "").strip()
     if not query:
@@ -1230,18 +1222,10 @@ def api_search():
 
 @app.route("/api/recent")
 def api_recent():
-    # ✅ FINAL FIX: send epoch ms from server (browser formats local time)
     limit = int(request.args.get("limit") or 5)
     rows = fetch_recent(limit=limit)
-
     for r in rows:
-        dt = r["created_at"]
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        r["created_at"] = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        r["created_at_ms"] = int(dt.timestamp() * 1000)
-
+        r["created_at"] = r["created_at"].isoformat()
     return jsonify({"rows": rows})
 
 
@@ -1259,7 +1243,7 @@ def api_export():
     w = csv.writer(buf)
     w.writerow(
         [
-            "created_at_utc",
+            "created_at",
             "query_text",
             "place_name",
             "lat",
@@ -1272,14 +1256,9 @@ def api_export():
         ]
     )
     for r in rows:
-        dt = r["created_at"]
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt_utc = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
         w.writerow(
             [
-                dt_utc,
+                r["created_at"].isoformat(),
                 r.get("query_text"),
                 r.get("place_name"),
                 r.get("lat"),
