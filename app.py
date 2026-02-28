@@ -814,7 +814,6 @@ def index():
       </div>
 
       <div class="kpis">
-        <!-- Temperature: Fire animation -->
         <div class="card tempFire">
           <div class="icon">🌡️</div>
           <div style="width:100%">
@@ -825,7 +824,6 @@ def index():
           </div>
         </div>
 
-        <!-- AQI: Wind animation + Meter -->
         <div class="card aqiWind">
           <div class="icon">🫁</div>
           <div style="width:100%">
@@ -853,7 +851,6 @@ def index():
           </svg>
         </div>
 
-        <!-- Traffic: Moving car -->
         <div class="card">
           <div class="icon">🚗</div>
           <div style="width:100%">
@@ -914,7 +911,7 @@ def index():
   function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  // show local browser time
+  // Browser local time (no timezone forcing from backend)
   function fmtTimeLocal(iso){
     try{
       const d = new Date(iso);
@@ -1349,8 +1346,12 @@ def api_recent():
     limit = int(request.args.get("limit") or 20)
     limit = max(1, min(limit, 200))
     rows = fetch_recent(limit=limit)
+
+    # ✅ NORMAL TIME: no timezone conversion, no "Z"
     for r in rows:
-        r["created_at"] = r["created_at"].isoformat()
+        dt = r.get("created_at")
+        r["created_at"] = dt.isoformat() if dt is not None else None
+
     return jsonify({"rows": rows})
 
 
@@ -1383,7 +1384,7 @@ def api_export():
     for r in rows:
         w.writerow(
             [
-                r["created_at"].isoformat(),
+                (r["created_at"].isoformat() if r.get("created_at") else ""),
                 r.get("query_text"),
                 r.get("place_name"),
                 r.get("lat"),
