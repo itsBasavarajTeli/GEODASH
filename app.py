@@ -1,13 +1,13 @@
 import os
 import csv
 import io
-from datetime import timezone
-
 import requests
 import psycopg2
 from psycopg2.extras import RealDictCursor
 from flask import Flask, request, jsonify, render_template_string, Response
 from dotenv import load_dotenv
+from zoneinfo import ZoneInfo
+from datetime import timezone
 
 load_dotenv()
 
@@ -24,6 +24,9 @@ TOMTOM_TRAFFIC_TILE_URL = os.getenv(
     "TOMTOM_TRAFFIC_TILE_URL",
     "https://api.tomtom.com/traffic/map/4/tile/flow/relative/{z}/{x}/{y}.png?key={key}",
 )
+
+# India timezone for display-safe conversions (server-side)
+IST = ZoneInfo("Asia/Kolkata")
 
 app = Flask(__name__)
 
@@ -86,7 +89,7 @@ def save_to_db(query_text, place, lat, lon, weather, aqi_0_500, traffic):
         conn.commit()
 
 
-def fetch_recent(limit=5):
+def fetch_recent(limit=20):
     init_db()
     with db_conn() as conn:
         with conn.cursor(cursor_factory=RealDictCursor) as cur:
@@ -121,6 +124,24 @@ def fetch_today_stats():
                 """
             )
             return cur.fetchone() or {}
+
+
+def _dt_to_ms(dt):
+    """Return epoch milliseconds for dt (safe for tz-aware/naive)."""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
+
+
+def _dt_to_ist_iso(dt):
+    """Return IST ISO string (for display/debug)."""
+    if dt is None:
+        return None
+    if getattr(dt, "tzinfo", None) is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(IST).isoformat()
 
 
 # ---------------------------
@@ -388,12 +409,7 @@ def tomtom_route(o_lat, o_lon, d_lat, d_lon, mode: str):
     try:
         gi = route0.get("guidance", {}).get("instructions", []) or []
         for x in gi[:8]:
-            instr.append(
-                {
-                    "message": x.get("message"),
-                    "routeOffsetInMeters": x.get("routeOffsetInMeters"),
-                }
-            )
+            instr.append({"message": x.get("message"), "routeOffsetInMeters": x.get("routeOffsetInMeters")})
     except Exception:
         instr = []
 
@@ -763,11 +779,11 @@ def index():
 
       <div class="grid2">
         <div class="panel chartBox">
-          <div class="label" style="margin-bottom:8px">AQI trend (last 5)</div>
+          <div class="label" style="margin-bottom:8px">AQI trend (last 20)</div>
           <canvas id="cAqi"></canvas>
         </div>
         <div class="panel chartBox">
-          <div class="label" style="margin-bottom:8px">Traffic speed trend (last 5)</div>
+          <div class="label" style="margin-bottom:8px">Traffic speed trend (last 20)</div>
           <canvas id="cTrf"></canvas>
         </div>
       </div>
@@ -804,16 +820,17 @@ def index():
 
 <script>
   const TRAFFIC_TILE_URL = "{{TRAFFIC_TILE_URL}}";
+
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  // ✅ FINAL FIX: Use epoch milliseconds from server (always correct)
-  function fmtTimeLocalFromMs(ms){
+  // ✅ Robust time formatting (uses epoch ms, avoids timezone parsing bugs)
+  function fmtTimeFromMs(ms){
     try{
       const d = new Date(Number(ms));
       return d.toLocaleTimeString([], { hour:"2-digit", minute:"2-digit" });
     }catch(e){ return "—"; }
   }
-  function fmtDateTimeLocalFromMs(ms){
+  function fmtDateTimeFromMs(ms){
     try{
       const d = new Date(Number(ms));
       return d.toLocaleString([], {
@@ -821,6 +838,21 @@ def index():
         hour:"2-digit", minute:"2-digit"
       });
     }catch(e){ return "—"; }
+  }
+
+  // ✅ KPI number animation
+  function animateNumber(el, toValue, suffix=""){
+    const duration = 800;
+    const startValue = 0;
+    const startTime = performance.now();
+
+    function step(now){
+      const t = Math.min((now - startTime) / duration, 1);
+      const val = Math.round(startValue + (toValue - startValue) * t);
+      el.innerText = String(val) + suffix;
+      if(t < 1) requestAnimationFrame(step);
+    }
+    requestAnimationFrame(step);
   }
 
   let lastLatLng = null;
@@ -1004,14 +1036,16 @@ def index():
   }
   function exportCSV(){ window.open("/api/export?limit=200", "_blank"); }
 
-  // Recent + charts
+  // ✅ Recent list stays last 5, but charts show last 20
   async function loadRecent(){
-    const r = await fetch("/api/recent?limit=5");
+    const r = await fetch("/api/recent?limit=20");
     const js = await r.json();
     const el = document.getElementById("list");
     el.innerHTML = "";
 
-    js.rows.forEach(row=>{
+    // show last 5 in list
+    const showRows = (js.rows || []).slice(0, 5);
+    showRows.forEach(row=>{
       const d = document.createElement("div");
       d.className="item";
       const place = row.place_name || row.query_text;
@@ -1019,7 +1053,7 @@ def index():
       d.innerHTML = `
         <div style="font-weight:950">${place}</div>
         <div class="rowMini">
-          <span class="tag">${fmtDateTimeLocalFromMs(row.created_at_ms)}</span>
+          <span class="tag">${fmtDateTimeFromMs(row.created_at_ms)}</span>
           <span class="tag">Temp: ${row.temperature_c ?? "—"} °C</span>
           <span class="tag">AQI: ${row.aqi ?? "—"} / 500</span>
           <span class="tag">Speed: ${row.traffic_speed_kmh ?? "—"} km/h</span>
@@ -1038,12 +1072,13 @@ def index():
       el.appendChild(d);
     });
 
-    const last = js.rows.slice(0, 5).reverse();
-    chartAqi.data.labels = last.map(x=>fmtTimeLocalFromMs(x.created_at_ms));
+    // charts: last 20
+    const last = (js.rows || []).slice(0, 20).reverse();
+    chartAqi.data.labels = last.map(x=>fmtTimeFromMs(x.created_at_ms));
     chartAqi.data.datasets[0].data = last.map(x=>x.aqi);
     chartAqi.update();
 
-    chartTrf.data.labels = last.map(x=>fmtTimeLocalFromMs(x.created_at_ms));
+    chartTrf.data.labels = last.map(x=>fmtTimeFromMs(x.created_at_ms));
     chartTrf.data.datasets[0].data = last.map(x=>x.traffic_speed_kmh);
     chartTrf.update();
   }
@@ -1065,7 +1100,12 @@ def index():
     document.getElementById("placePill").innerText =
       `${js.place} (${js.lat.toFixed(5)}, ${js.lon.toFixed(5)})`;
 
-    document.getElementById("kTemp").innerText = (js.temperature_c ?? "—") + (js.temperature_c!=null ? " °C" : "");
+    // ✅ KPI animation restored
+    if(js.temperature_c != null){
+      animateNumber(document.getElementById("kTemp"), Math.round(js.temperature_c), " °C");
+    }else{
+      document.getElementById("kTemp").innerText = "—";
+    }
     document.getElementById("kHum").innerText = "Humidity: " + (js.humidity_pct ?? "—") + (js.humidity_pct!=null ? " %" : "");
     document.getElementById("kWind").innerText = "Wind: " + (js.wind_speed_ms ?? "—") + (js.wind_speed_ms!=null ? " m/s" : "");
 
@@ -1076,7 +1116,11 @@ def index():
     if(js.weather_desc) wxBits.push(js.weather_desc);
     document.getElementById("kWx").innerText = wxBits.length ? wxBits.join(" • ") : "—";
 
-    document.getElementById("kAqi").innerText = (js.aqi?.aqi_0_500 ?? "—");
+    if(js.aqi?.aqi_0_500 != null){
+      animateNumber(document.getElementById("kAqi"), Number(js.aqi.aqi_0_500));
+    }else{
+      document.getElementById("kAqi").innerText = "—";
+    }
     document.getElementById("kAqiLbl").innerText = js.aqi?.label ?? "—";
 
     const comp = js.aqi?.components || {};
@@ -1091,7 +1135,12 @@ def index():
     const sp = js.traffic?.currentSpeed_kmh;
     const ff = js.traffic?.freeFlowSpeed_kmh;
     const lbl = js.traffic?.congestion_label;
-    document.getElementById("kTrf").innerText = (sp ?? "—") + (sp!=null ? " km/h" : "");
+
+    if(sp != null){
+      animateNumber(document.getElementById("kTrf"), Math.round(Number(sp)), " km/h");
+    }else{
+      document.getElementById("kTrf").innerText = "—";
+    }
     document.getElementById("kTrf2").innerText =
       (lbl ? (lbl + " • ") : "") + "Free flow: " + (ff ?? "—") + (ff!=null ? " km/h" : "");
 
@@ -1196,9 +1245,7 @@ def index():
 @app.route("/api/search")
 def api_search():
     if not TOMTOM_API_KEY or not OPENWEATHER_API_KEY:
-        return jsonify(
-            {"error": "Missing API keys. Set TOMTOM_API_KEY and OPENWEATHER_API_KEY in Render env vars."}
-        ), 400
+        return jsonify({"error": "Missing API keys. Set TOMTOM_API_KEY and OPENWEATHER_API_KEY in Render env vars."}), 400
 
     query = (request.args.get("query") or "").strip()
     if not query:
@@ -1230,18 +1277,14 @@ def api_search():
 
 @app.route("/api/recent")
 def api_recent():
-    # ✅ FINAL FIX: send epoch ms from server (browser formats local time)
-    limit = int(request.args.get("limit") or 5)
+    limit = int(request.args.get("limit") or 20)
     rows = fetch_recent(limit=limit)
-
     for r in rows:
-        dt = r["created_at"]
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-
-        r["created_at"] = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-        r["created_at_ms"] = int(dt.timestamp() * 1000)
-
+        dt = r.get("created_at")
+        # keep ISO too (debug), but frontend uses ms (safe)
+        r["created_at"] = dt.isoformat() if dt else None
+        r["created_at_ms"] = _dt_to_ms(dt)
+        r["created_at_ist"] = _dt_to_ist_iso(dt)
     return jsonify({"rows": rows})
 
 
@@ -1259,7 +1302,7 @@ def api_export():
     w = csv.writer(buf)
     w.writerow(
         [
-            "created_at_utc",
+            "created_at",
             "query_text",
             "place_name",
             "lat",
@@ -1272,14 +1315,9 @@ def api_export():
         ]
     )
     for r in rows:
-        dt = r["created_at"]
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        dt_utc = dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-
         w.writerow(
             [
-                dt_utc,
+                r["created_at"].isoformat() if r.get("created_at") else "",
                 r.get("query_text"),
                 r.get("place_name"),
                 r.get("lat"),
