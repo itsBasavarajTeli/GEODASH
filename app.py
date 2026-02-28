@@ -1,3 +1,4 @@
+from datetime import timezone
 import os
 import csv
 import io
@@ -814,6 +815,7 @@ def index():
       </div>
 
       <div class="kpis">
+        <!-- Temperature: Fire animation -->
         <div class="card tempFire">
           <div class="icon">🌡️</div>
           <div style="width:100%">
@@ -824,6 +826,7 @@ def index():
           </div>
         </div>
 
+        <!-- AQI: Wind animation + Meter -->
         <div class="card aqiWind">
           <div class="icon">🫁</div>
           <div style="width:100%">
@@ -851,6 +854,7 @@ def index():
           </svg>
         </div>
 
+        <!-- Traffic: Moving car -->
         <div class="card">
           <div class="icon">🚗</div>
           <div style="width:100%">
@@ -911,7 +915,8 @@ def index():
   function clamp(n,a,b){ return Math.max(a, Math.min(b, n)); }
   function setStatus(msg){ document.getElementById("status").innerText = msg; }
 
-  // Browser local time (no timezone forcing from backend)
+  // ✅ IMPORTANT: We send timestamps as UTC "Z" from backend
+  // Browser will convert to your local time automatically (same on Local + Render)
   function fmtTimeLocal(iso){
     try{
       const d = new Date(iso);
@@ -1124,6 +1129,7 @@ def index():
 
     const rows = js.rows || [];
 
+    // ✅ last 5 only list
     rows.slice(0,5).forEach(row=>{
       const d = document.createElement("div");
       d.className="item";
@@ -1347,10 +1353,19 @@ def api_recent():
     limit = max(1, min(limit, 200))
     rows = fetch_recent(limit=limit)
 
-    # ✅ NORMAL TIME: no timezone conversion, no "Z"
+    # ✅ KEY FIX: Always send UTC "Z" timestamp.
+    # Browser converts to your local time -> Render will look same as Local.
     for r in rows:
         dt = r.get("created_at")
-        r["created_at"] = dt.isoformat() if dt is not None else None
+
+        # If DB returned naive datetime, treat as UTC
+        if dt is not None and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+
+        r["created_at"] = (
+            dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if dt is not None else None
+        )
 
     return jsonify({"rows": rows})
 
@@ -1382,9 +1397,18 @@ def api_export():
         ]
     )
     for r in rows:
+        dt = r.get("created_at")
+        # keep export consistent and safe
+        if dt is not None and dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        created_out = (
+            dt.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+            if dt is not None else ""
+        )
+
         w.writerow(
             [
-                (r["created_at"].isoformat() if r.get("created_at") else ""),
+                created_out,
                 r.get("query_text"),
                 r.get("place_name"),
                 r.get("lat"),
